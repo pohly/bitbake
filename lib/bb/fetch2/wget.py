@@ -30,6 +30,7 @@ import tempfile
 import subprocess
 import os
 import logging
+import errno
 import bb
 import bb.progress
 import urllib.request, urllib.parse, urllib.error
@@ -144,6 +145,7 @@ class Wget(FetchMethod):
                     if sock:
                         self.sock = sock
                     else:
+                        logger.info('Connecting to %s %s (%s)' % (self.host, self.port, type(self.port)))
                         self.sock = socket.create_connection((self.host, self.port),
                                     self.timeout, self.source_address)
                         fetch.connection_cache.add_connection(self.host, self.port, self.sock)
@@ -206,8 +208,19 @@ class Wget(FetchMethod):
                     h.request(req.get_method(), req.selector, req.data, headers)
                 except socket.error as err: # XXX what error?
                     # Don't close connection when cache is enabled.
+                    # Instead, try to detect connections that are no longer
+                    # usable (for example, closed unexpectedly) and remove
+                    # them from the cache.
                     if fetch.connection_cache is None:
                         h.close()
+                    elif isinstance(err, OSError) and err.errno == errno.EBADF:
+                        # This happens when the server closes the connection despite the Keep-Alive.
+                        # Apparently urllib then uses the file descriptor, expecting it to be
+                        # connected, when in reality the connection is already gone.
+                        # We let the request fail and expect it to be tried once more.
+                        # If it still fails, we give up. Unfortunately it can fail
+                        # permanently in the exact same way for bad HTTP proxy settings.
+                        fetch.connection_cache.remove_connection(h.host, h.port)
                     raise urllib.error.URLError(err)
                 else:
                     try:
@@ -324,11 +337,11 @@ class Wget(FetchMethod):
             opener.open(r)
         except urllib.error.URLError as e:
             if try_again:
-                logger.debug(2, "checkstatus: trying again")
+                logger.info("checkstatus: trying again")
                 return self.checkstatus(fetch, ud, d, False)
             else:
                 # debug for now to avoid spamming the logs in e.g. remote sstate searches
-                logger.debug(2, "checkstatus() urlopen failed: %s" % e)
+                logger.info("checkstatus() urlopen failed: %s" % e)
                 return False
         return True
 
